@@ -1,17 +1,14 @@
 package kvstore
 
-import akka.actor.{ OneForOneStrategy, Props, ActorRef, Actor }
+import akka.actor._
 import kvstore.Arbiter._
+import kvstore.Persistence.{Persist, PersistenceException}
 import scala.collection.immutable.Queue
-import akka.actor.SupervisorStrategy.Restart
+import akka.actor.SupervisorStrategy.{Resume, Stop, Restart}
 import scala.annotation.tailrec
 import akka.pattern.{ ask, pipe }
-import akka.actor.Terminated
 import scala.concurrent.duration._
 import scala.language.postfixOps
-import akka.actor.PoisonPill
-import akka.actor.OneForOneStrategy
-import akka.actor.SupervisorStrategy
 import akka.util.Timeout
 
 object Replica {
@@ -30,7 +27,7 @@ object Replica {
 
   def props(arbiter: ActorRef, persistenceProps: Props): Props = Props(new Replica(arbiter, persistenceProps))
 
-  case class CheckPersist(snapshot: Replicator.Snapshot)
+  case class AckCond(sender: ActorRef, pmsg: Persist, id: Long, toConfirm: Set[ActorRef])
 }
 
 class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
@@ -49,7 +46,20 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   var secondaries = Map.empty[ActorRef, ActorRef]
   // the current set of replicators
   var replicators = Set.empty[ActorRef]
-  var prevSeq = 0L
+  var expectedSeq = 0L
+
+  val persistence = context.actorOf(persistenceProps, name = "persist")
+  var persistAcks = Map.empty[String, (ActorRef, Persist, Long)]
+
+  override val supervisorStrategy = OneForOneStrategy(maxNrOfRetries = 10, withinTimeRange = 10 seconds) {
+    case _: PersistenceException => Resume
+    case _: Exception => Stop
+  }
+
+  private[this] val tick = context.system.scheduler.schedule(100 millis, 100 millis, self, Tick)
+  private[this] val oneSecondInNanos = (1 second).toNanos
+
+  override def postStop() = tick.cancel()
 
   def receive = {
     case JoinedPrimary   => context.become(leader)
@@ -58,69 +68,84 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
   /* TODO Behavior for  the leader role. */
   val leader: Receive = {
-
     case Replicas(replicas) => handleReplicas(replicas)
 
     case Get(key, id) =>
       sender ! GetResult(key, kv.get(key), id)
 
     case Insert(key, value, id) =>
-      kv += key -> value
-      // TODO: Hack
-      sender ! OperationAck(id)
       replicators.foreach { _ ! Replicate(key, Some(value), id) }
-      // TODO: Wait for Replicated
-      //OperationAck(id) | OperationFailed(id)
-      //StartTick(1 second) : OperationFailed(id) -> t > 1 sec
-      //persistence ! Persist(key, valueOption, id)
+      store(key, Some(value), id)
 
     case Remove(key, id) =>
-      kv -= key
-      // TODO: Hack
-      sender ! OperationAck(id)
       replicators.foreach { _ ! Replicate(key, None, id) }
-      // TODO: Wait for Replicated
-      //OperationAck(id) | OperationFailed(id)
-      //StartTick(1 second) : OperationFailed(id) -> t > 1 sec
-      //persistence ! Persist(key, valueOption, id)
+      store(key, None, id)
 
     case Persisted(key, id) =>
+      persistAcks.get(key).foreach { case (sender, pmsg, t) =>
+        val msg =
+          if (System.nanoTime - t <= oneSecondInNanos) OperationAck(id)
+          else OperationFailed(id)
+        sender ! msg
+        persistAcks -= key
+      }
 
+    case Tick =>
+      persistAcks.values.foreach {
+        case (sender, pmsg, t) =>
+          if (System.nanoTime - t <= oneSecondInNanos)
+            persistence ! pmsg
+          else {
+            sender ! OperationFailed(pmsg.id)
+            persistAcks -= pmsg.key
+          }
+      }
   }
 
   /* TODO Behavior for the replica role. */
   val replica: Receive = {
-
     case Get(key, id) => sender ! GetResult(key, kv.get(key), id)
 
     case snapshot @ Snapshot(key, valueOption, seq) =>
-      val expectedSeq = prevSeq
       if (seq > expectedSeq) {
         // Ignore
       } else if (seq < expectedSeq) {
         // Ignore + Ack
         sender ! SnapshotAck(key, seq)
       } else {
-        // TODO Use persistence ! Persist(key, valueOption, id)
-        // TODO Once persisted, sender ! SnapshotAck(key, seq)
-        context.system.scheduler.scheduleOnce(200 millis, self, CheckPersist(snapshot))
-        sender ! SnapshotAck(key, seq)
-
-        valueOption match {
-          case Some(value) => kv += key -> value
-          case None => kv -= key
-        }
-
-        prevSeq = seq + 1
+        store(key, valueOption, seq)
+        expectedSeq = seq + 1
       }
 
-    case CheckPersist(snapshot) =>
-
     case Persisted(key, id) =>
+      persistAcks.get(key).foreach { case (sender, pmsg, t) =>
+        if (System.nanoTime - t <= oneSecondInNanos)
+          sender ! SnapshotAck(key, id)
+        persistAcks -= key
+      }
+
+    case Tick =>
+      persistAcks.values.foreach {
+        case (sender, pmsg, t) =>
+          if (System.nanoTime - t <= oneSecondInNanos)
+            persistence ! pmsg
+          else
+            persistAcks -= pmsg.key
+      }
+  }
+
+  private def store(key: String, valueOption: Option[String], id: Long): Unit = {
+    val pmsg = Persist(key, valueOption, id)
+    persistence ! pmsg
+    persistAcks += key -> (sender, pmsg, System.nanoTime)
+
+    valueOption match {
+      case Some(value) => kv += key -> value
+      case None => kv -= key
+    }
   }
 
   private[this] def handleReplicas(replicas: Set[ActorRef]): Unit = {
-
     // Allocate one Replicator for each replica that joined except for self
     replicas.filter(r => r != self && replicators(r)).foreach { replica =>
       val replicator = context.actorOf(Props(new Replicator(self)))

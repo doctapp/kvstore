@@ -1,15 +1,14 @@
 package kvstore
 
-import akka.actor.Props
-import akka.actor.Actor
-import akka.actor.ActorRef
+import akka.actor.{Actor, ActorRef, Props}
+
 import scala.concurrent.duration._
 import scala.language.postfixOps
 
 object Replicator {
   case class Replicate(key: String, valueOption: Option[String], id: Long)
   case class Replicated(key: String, id: Long)
-  
+
   case class Snapshot(key: String, valueOption: Option[String], seq: Long)
   case class SnapshotAck(key: String, seq: Long)
 
@@ -20,9 +19,8 @@ object Replicator {
 
 class Replicator(val replica: ActorRef) extends Actor {
   import Replicator._
-  import Replica._
   import context.dispatcher
-  
+
   /*
    * The contents of this actor is just a suggestion, you can implement it in any way you like.
    */
@@ -44,7 +42,6 @@ class Replicator(val replica: ActorRef) extends Actor {
   override def postStop() = tick.cancel()
 
   def receive: Receive = {
-
     case req @ Replicate(key, valueOption, id) =>
       val seq = nextSeq
       replica ! Snapshot(key, valueOption, seq)
@@ -62,7 +59,7 @@ class Replicator(val replica: ActorRef) extends Actor {
     case Tick ⇒
       // Every 100 milliseconds, retransmit all unacknowledged changes to replica
       acks.foreach {
-        case (seq, (sender, req)) => replica ! Snapshot(req.key, req.valueOption, seq)
+        case (seq, (_, req)) => replica ! Snapshot(req.key, req.valueOption, seq)
       }
   }
 }
