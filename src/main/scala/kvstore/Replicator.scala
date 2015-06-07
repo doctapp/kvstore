@@ -48,18 +48,15 @@ class Replicator(val replica: ActorRef) extends Actor {
       acks += seq -> (sender, req)
 
     case SnapshotAck(key, seq) =>
-      acks
-        .get(seq)
-        .foreach {
-        case (sender, req) =>
-          sender ! Replicated(key, req.id)
-          acks -= seq
+      acks.get(seq).foreach { case (s, req) =>
+        s ! Replicated(key, req.id)
+        acks -= seq
       }
 
     case Tick ⇒
       // Every 100 milliseconds, retransmit all unacknowledged changes to replica
-      acks.foreach {
-        case (seq, (_, req)) => replica ! Snapshot(req.key, req.valueOption, seq)
+      acks.foreach { case (seq, (_, req)) =>
+        replica ! Snapshot(req.key, req.valueOption, seq)
       }
   }
 }

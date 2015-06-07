@@ -27,7 +27,7 @@ object Replica {
 
   def props(arbiter: ActorRef, persistenceProps: Props): Props = Props(new Replica(arbiter, persistenceProps))
 
-  case class AckCond(sender: ActorRef, pmsg: Persist, id: Long, toConfirm: Set[ActorRef])
+  case class OutstandingAck(sender: ActorRef, timestamp: Long, primaryToConfirm: Option[ActorRef], secondariesToConfirm: Set[ActorRef])
 }
 
 class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
@@ -46,18 +46,18 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   var secondaries = Map.empty[ActorRef, ActorRef]
   // the current set of replicators
   var replicators = Set.empty[ActorRef]
-  var expectedSeq = 0L
 
-  val persistence = context.actorOf(persistenceProps, name = "persist")
-  var persistAcks = Map.empty[String, (ActorRef, Persist, Long)]
+  private[this] var expectedSeq = 0L
+  private[this] val persistence = context.actorOf(persistenceProps, name = "persist")
+  private[this] var persistAcks = Map.empty[Long, (ActorRef, Persist, Long)]
+  private[this] var outstandingAcks = Map.empty[Long, OutstandingAck]
+  private[this] val tick = context.system.scheduler.schedule(100 millis, 100 millis, self, Tick)
+  private[this] val oneSecondInNanos = (1 second).toNanos
 
   override val supervisorStrategy = OneForOneStrategy(maxNrOfRetries = 10, withinTimeRange = 10 seconds) {
     case _: PersistenceException => Resume
     case _: Exception => Stop
   }
-
-  private[this] val tick = context.system.scheduler.schedule(100 millis, 100 millis, self, Tick)
-  private[this] val oneSecondInNanos = (1 second).toNanos
 
   override def postStop() = tick.cancel()
 
@@ -74,35 +74,41 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
       sender ! GetResult(key, kv.get(key), id)
 
     case Insert(key, value, id) =>
-      replicators.foreach { _ ! Replicate(key, Some(value), id) }
-      store(key, Some(value), id)
+      val valueOption = Some(value)
+      store(key, valueOption, id)
+      replicate(key, valueOption, id)
+      outstandingAcks += id -> OutstandingAck(sender, System.nanoTime, Some(self), replicators)
 
     case Remove(key, id) =>
-      replicators.foreach { _ ! Replicate(key, None, id) }
       store(key, None, id)
+      replicate(key, None, id)
+      outstandingAcks += id -> OutstandingAck(sender, System.nanoTime, Some(self), replicators)
 
     case Persisted(key, id) =>
-      persistAcks.get(key).foreach { case (sender, pmsg, t) =>
-        val msg =
-          if (System.nanoTime - t <= oneSecondInNanos) OperationAck(id)
-          else OperationFailed(id)
-        sender ! msg
-        persistAcks -= key
+      outstandingAcks.get(id).foreach { o =>
+        outstandingAcks += id -> o.copy(primaryToConfirm = None)
+        processOutstanding(id, System.nanoTime)
+      }
+      persistAcks -= id
+
+    case Replicated(key, id) =>
+      outstandingAcks.get(id).foreach { o =>
+        outstandingAcks += id -> o.copy(secondariesToConfirm = o.secondariesToConfirm - sender)
+        processOutstanding(id, System.nanoTime)
       }
 
     case Tick =>
-      persistAcks.values.foreach {
-        case (sender, pmsg, t) =>
-          if (System.nanoTime - t <= oneSecondInNanos)
-            persistence ! pmsg
-          else {
-            sender ! OperationFailed(pmsg.id)
-            persistAcks -= pmsg.key
-          }
+      val now = System.nanoTime
+      outstandingAcks.keys.foreach(processOutstanding(_, now))
+      persistAcks.foreach {
+        case (id, (sender, msg, t)) =>
+          if (now - t <= oneSecondInNanos)
+            persistence ! msg
+          else
+            persistAcks -= id
       }
   }
 
-  /* TODO Behavior for the replica role. */
   val replica: Receive = {
     case Get(key, id) => sender ! GetResult(key, kv.get(key), id)
 
@@ -118,26 +124,41 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
       }
 
     case Persisted(key, id) =>
-      persistAcks.get(key).foreach { case (sender, pmsg, t) =>
+      persistAcks.get(id).foreach { case (sender, _, t) =>
         if (System.nanoTime - t <= oneSecondInNanos)
           sender ! SnapshotAck(key, id)
-        persistAcks -= key
+        persistAcks -= id
       }
 
     case Tick =>
-      persistAcks.values.foreach {
-        case (sender, pmsg, t) =>
-          if (System.nanoTime - t <= oneSecondInNanos)
-            persistence ! pmsg
+      val now = System.nanoTime
+      persistAcks.foreach {
+        case (id, (sender, msg, t)) =>
+          if (now - t <= oneSecondInNanos)
+            persistence ! msg
           else
-            persistAcks -= pmsg.key
+            persistAcks -= id
       }
   }
 
+  private def processOutstanding(id: Long, now: Long): Unit = {
+    outstandingAcks.get(id).foreach { o =>
+      if (now - o.timestamp <= oneSecondInNanos) {
+        if (o.primaryToConfirm.isEmpty && o.secondariesToConfirm.isEmpty) {
+          o.sender ! OperationAck(id)
+          outstandingAcks -= id
+        }
+      } else {
+        o.sender ! OperationFailed(id)
+        outstandingAcks -= id
+      }
+    }
+  }
+
   private def store(key: String, valueOption: Option[String], id: Long): Unit = {
-    val pmsg = Persist(key, valueOption, id)
-    persistence ! pmsg
-    persistAcks += key -> (sender, pmsg, System.nanoTime)
+    val msg = Persist(key, valueOption, id)
+    persistence ! msg
+    persistAcks += id -> (sender, msg, System.nanoTime)
 
     valueOption match {
       case Some(value) => kv += key -> value
@@ -145,10 +166,15 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     }
   }
 
-  private[this] def handleReplicas(replicas: Set[ActorRef]): Unit = {
+  private def replicate(key: String, valueOption: Option[String], id: Long): Unit = {
+    val msg = Replicate(key, valueOption, id)
+    replicators.foreach(_ ! msg)
+  }
+
+  private def handleReplicas(replicas: Set[ActorRef]): Unit = {
     // Allocate one Replicator for each replica that joined except for self
-    replicas.filter(r => r != self && replicators(r)).foreach { replica =>
-      val replicator = context.actorOf(Props(new Replicator(self)))
+    replicas.filter(r => r != self && !replicators.contains(r)).foreach { replica =>
+      val replicator = context.actorOf(Props(new Replicator(replica)))
       replicators += replicator
       secondaries += replica -> replicator
 
@@ -157,11 +183,16 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     }
 
     // Stop the replicator for each replica that left
-    secondaries.filter { case (replica, _) => !replicas(replica) }.foreach { case (replica, replicator) =>
+    secondaries.filter { case (replica, _) => !replicas.contains(replica) }.foreach { case (replica, replicator) =>
       context.stop(replicator)
       secondaries -= replica
       replicators -= replicator
-      // TODO Handle operations waiting on this replica
+
+      val now = System.nanoTime
+      outstandingAcks.filter(_._2.secondariesToConfirm.contains(replicator)).foreach { case (id, o) =>
+        outstandingAcks += id -> o.copy(secondariesToConfirm = o.secondariesToConfirm - replicator)
+        processOutstanding(id, now)
+      }
     }
   }
 }
